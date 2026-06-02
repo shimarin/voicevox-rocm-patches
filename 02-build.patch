@@ -1,0 +1,191 @@
+diff --git a/cmake/CMakeLists.txt b/cmake/CMakeLists.txt
+index 3b0503fe66..b932b35c32 100644
+--- a/cmake/CMakeLists.txt
++++ b/cmake/CMakeLists.txt
+@@ -10,6 +10,11 @@ set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+ cmake_policy(SET CMP0092 NEW)
+ cmake_policy(SET CMP0091 NEW)
+ cmake_policy(SET CMP0117 NEW)
++
++# cmake 4.x: allow deprecated FetchContent_Populate() to still work
++if(POLICY CMP0169)
++  cmake_policy(SET CMP0169 OLD)
++endif()
+ # Don't let cmake set a default value for CMAKE_CUDA_ARCHITECTURES
+ cmake_policy(SET CMP0104 OLD)
+ 
+@@ -295,7 +300,8 @@ if (onnxruntime_USE_ROCM)
+   endif()
+ 
+   file(GLOB rocm_cmake_components ${onnxruntime_ROCM_HOME}/lib/cmake/*)
+-  list(APPEND CMAKE_PREFIX_PATH ${rocm_cmake_components})
++  file(GLOB rocm_cmake_components64 ${onnxruntime_ROCM_HOME}/lib64/cmake/*)
++  list(APPEND CMAKE_PREFIX_PATH ${rocm_cmake_components} ${rocm_cmake_components64})
+   # Force cmake to accept the configured HIP compiler. Because the configured CMAKE_PREFIX_PATH does not work during
+   # enable_language(HIP), we might need to move configuring of CMAKE_PREFIX_PATH to build.py (in the future).
+   set(CMAKE_HIP_COMPILER_FORCED ON)
+@@ -325,7 +331,11 @@ if (onnxruntime_USE_ROCM)
+ 
+   # replicate strategy used by pytorch to get ROCM_VERSION
+   # https://github.com/pytorch/pytorch/blob/8eb21488fdcdb8b0e6fa2e46179b5fa6c42e75af/cmake/public/LoadHIP.cmake#L153-L173
+-  file(READ "${onnxruntime_ROCM_HOME}/.info/version-dev" ROCM_VERSION_DEV_RAW)
++  if(EXISTS "${onnxruntime_ROCM_HOME}/.info/version-dev")
++    file(READ "${onnxruntime_ROCM_HOME}/.info/version-dev" ROCM_VERSION_DEV_RAW)
++  else()
++    set(ROCM_VERSION_DEV_RAW "${onnxruntime_ROCM_VERSION}.0-9999")
++  endif()
+   string(REGEX MATCH "^([0-9]+)\.([0-9]+)\.([0-9]+)-.*$" ROCM_VERSION_DEV_MATCH ${ROCM_VERSION_DEV_RAW})
+   if (ROCM_VERSION_DEV_MATCH)
+     set(ROCM_VERSION_DEV_MAJOR ${CMAKE_MATCH_1})
+diff --git a/cmake/deps.txt b/cmake/deps.txt
+index ba9c2bb73c..ca0d2b3e3f 100644
+--- a/cmake/deps.txt
++++ b/cmake/deps.txt
+@@ -21,7 +21,7 @@ dlpack;https://github.com/dmlc/dlpack/archive/refs/tags/v0.6.zip;4d565dd2e5b3132
+ # it contains changes on top of 3.4.0 which are required to fix build issues.
+ # Until the 3.4.1 release this is the best option we have.
+ # Issue link: https://gitlab.com/libeigen/eigen/-/issues/2744
+-eigen;https://gitlab.com/libeigen/eigen/-/archive/e7248b26a1ed53fa030c5c459f7ea095dfd276ac/eigen-e7248b26a1ed53fa030c5c459f7ea095dfd276ac.zip;be8be39fdbc6e60e94fa7870b280707069b5b81a
++eigen;https://gitlab.com/libeigen/eigen/-/archive/e7248b26a1ed53fa030c5c459f7ea095dfd276ac/eigen-e7248b26a1ed53fa030c5c459f7ea095dfd276ac.zip;32b145f525a8308d7ab1c09388b2e288312d8eba
+ flatbuffers;https://github.com/google/flatbuffers/archive/refs/tags/v1.12.0.zip;ba0a75fd12dbef8f6557a74e611b7a3d0c5fe7bf
+ fp16;https://github.com/Maratyszcza/FP16/archive/0a92994d729ff76a58f692d3028ca1b64b145d91.zip;b985f6985a05a1c03ff1bb71190f66d8f98a1494
+ fxdiv;https://github.com/Maratyszcza/FXdiv/archive/63058eff77e11aa15bf531df5dd34395ec3017c8.zip;a5658f4036402dbca7cebee32be57fb8149811e1
+diff --git a/cmake/external/onnxruntime_external_deps.cmake b/cmake/external/onnxruntime_external_deps.cmake
+index 4266c9244a..7e8be0f036 100644
+--- a/cmake/external/onnxruntime_external_deps.cmake
++++ b/cmake/external/onnxruntime_external_deps.cmake
+@@ -27,7 +27,6 @@ FetchContent_Declare(
+     re2
+     URL ${DEP_URL_re2}
+     URL_HASH SHA1=${DEP_SHA1_re2}
+-    FIND_PACKAGE_ARGS NAMES re2
+ )
+ 
+ if (onnxruntime_BUILD_UNIT_TESTS)
+@@ -48,7 +47,6 @@ if (onnxruntime_BUILD_UNIT_TESTS)
+     googletest
+     URL ${DEP_URL_googletest}
+     URL_HASH SHA1=${DEP_SHA1_googletest}
+-    FIND_PACKAGE_ARGS 1.14.0...<2.0.0 NAMES GTest
+   )
+ endif()
+ 
+@@ -70,7 +68,6 @@ if (NOT WIN32)
+     google_nsync
+     URL ${DEP_URL_google_nsync}
+     URL_HASH SHA1=${DEP_SHA1_google_nsync}
+-    FIND_PACKAGE_ARGS NAMES nsync
+     )
+ endif()
+ list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/external)
+@@ -104,7 +101,6 @@ FetchContent_Declare(
+     URL ${DEP_URL_flatbuffers}
+     URL_HASH SHA1=${DEP_SHA1_flatbuffers}
+     PATCH_COMMAND ${ONNXRUNTIME_FLATBUFFERS_PATCH_COMMAND}
+-    FIND_PACKAGE_ARGS 1.12.0...<2.0.0 NAMES Flatbuffers
+ )
+ 
+ # Download a protoc binary from Internet if needed
+@@ -167,7 +163,6 @@ FetchContent_Declare(
+     utf8_range
+     URL ${DEP_URL_utf8_range}
+     URL_HASH SHA1=${DEP_SHA1_utf8_range}
+-    FIND_PACKAGE_ARGS NAMES utf8_range
+ )
+ 
+ set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "Build test suite" FORCE)
+@@ -180,7 +175,6 @@ FetchContent_Declare(
+   URL ${DEP_URL_protobuf}
+   URL_HASH SHA1=${DEP_SHA1_protobuf}
+   PATCH_COMMAND ${ONNXRUNTIME_PROTOBUF_PATCH_COMMAND}
+-  FIND_PACKAGE_ARGS 3.21.12 NAMES Protobuf
+ )
+ 
+ set(protobuf_BUILD_TESTS OFF CACHE BOOL "Build protobuf tests" FORCE)
+@@ -209,7 +203,6 @@ FetchContent_Declare(
+   date
+   URL ${DEP_URL_date}
+   URL_HASH SHA1=${DEP_SHA1_date}
+-  FIND_PACKAGE_ARGS 3...<4 NAMES date
+ )
+ onnxruntime_fetchcontent_makeavailable(date)
+ 
+@@ -228,7 +221,6 @@ FetchContent_Declare(
+     nlohmann_json
+     URL ${DEP_URL_json}
+     URL_HASH SHA1=${DEP_SHA1_json}
+-    FIND_PACKAGE_ARGS 3.10 NAMES nlohmann_json
+ )
+ 
+ #TODO: include clog first
+@@ -309,7 +301,6 @@ if (CPUINFO_SUPPORTED)
+     pytorch_cpuinfo
+     URL ${DEP_URL_pytorch_cpuinfo}
+     URL_HASH SHA1=${DEP_SHA1_pytorch_cpuinfo}
+-    FIND_PACKAGE_ARGS NAMES cpuinfo
+   )
+   set(ONNXRUNTIME_CPUINFO_PROJ pytorch_cpuinfo)
+ endif()
+@@ -335,14 +326,12 @@ if(onnxruntime_USE_CUDA)
+     URL ${DEP_URL_microsoft_gsl}
+     URL_HASH SHA1=${DEP_SHA1_microsoft_gsl}
+     PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/gsl/1064.patch
+-    FIND_PACKAGE_ARGS 4.0 NAMES Microsoft.GSL
+   )
+ else()
+   FetchContent_Declare(
+     GSL
+     URL ${DEP_URL_microsoft_gsl}
+     URL_HASH SHA1=${DEP_SHA1_microsoft_gsl}
+-    FIND_PACKAGE_ARGS 4.0 NAMES Microsoft.GSL
+   )
+ endif()
+ 
+diff --git a/cmake/onnxruntime_providers_rocm.cmake b/cmake/onnxruntime_providers_rocm.cmake
+index b662682915..b10fd4309a 100644
+--- a/cmake/onnxruntime_providers_rocm.cmake
++++ b/cmake/onnxruntime_providers_rocm.cmake
+@@ -47,9 +47,15 @@
+   message("MIOPEN_VERSION_DEV_INT:   ${MIOPEN_VERSION_DEV_INT}")
+   add_definitions(-DMIOPEN_VERSION=${MIOPEN_VERSION_DEV_INT})
+ 
+-  find_library(RCCL_LIB rccl REQUIRED)
+-  find_library(ROCTRACER_LIB roctracer64 REQUIRED)
+-  set(ONNXRUNTIME_ROCM_LIBS roc::rocblas MIOpen hip::hipfft ${RCCL_LIB} ${ROCTRACER_LIB})
++  find_library(RCCL_LIB rccl)
++  find_library(ROCTRACER_LIB roctracer64)
++  set(ONNXRUNTIME_ROCM_LIBS roc::rocblas MIOpen hip::hipfft)
++  if(RCCL_LIB)
++    list(APPEND ONNXRUNTIME_ROCM_LIBS ${RCCL_LIB})
++  endif()
++  if(ROCTRACER_LIB)
++    list(APPEND ONNXRUNTIME_ROCM_LIBS ${ROCTRACER_LIB})
++  endif()
+ 
+   file(GLOB_RECURSE onnxruntime_providers_rocm_cc_srcs CONFIGURE_DEPENDS
+     "${ONNXRUNTIME_ROOT}/core/providers/rocm/*.h"
+diff --git a/onnxruntime/core/providers/cuda/tensor/gather_elements.cc b/onnxruntime/core/providers/cuda/tensor/gather_elements.cc
+index adae9c5a2e..f4e81cf177 100644
+--- a/onnxruntime/core/providers/cuda/tensor/gather_elements.cc
++++ b/onnxruntime/core/providers/cuda/tensor/gather_elements.cc
+@@ -175,6 +175,7 @@ Status GatherElements::ComputeInternal(OpKernelContext* context) const {
+   TensorShapeVector indices_shape_vec = indices_shape.AsShapeVector();
+   TensorShapeVector* p_indices_strides_vec = nullptr;
+   TensorShapeVector indices_strides_vec;
++  ORT_UNUSED_PARAMETER(indices_strides_vec);
+ #ifdef ENABLE_STRIDED_TENSORS
+   if (!indices_tensor->IsContiguous()) {
+     indices_strides_vec = ToShapeVector(indices_tensor->Strides());
+diff --git a/onnxruntime/core/providers/rocm/integer_gemm.cc b/onnxruntime/core/providers/rocm/integer_gemm.cc
+index 9771f42fd3..5d3322504f 100644
+--- a/onnxruntime/core/providers/rocm/integer_gemm.cc
++++ b/onnxruntime/core/providers/rocm/integer_gemm.cc
+@@ -48,7 +48,7 @@ Status GemmInt8(int m, int n, int k,
+     HIP_RETURN_IF_ERROR(hipMemcpy2DAsync(b_padded.get(), ldb_aligned, b, ldb, n, k, hipMemcpyDeviceToDevice, stream));
+   }
+ 
+-  auto* ort_rocm_stream = dynamic_cast<RocmStream*>(ort_stream);
++  auto* ort_rocm_stream = static_cast<RocmStream*>(ort_stream);
+   auto rocblas = ort_rocm_stream->rocblas_handle_;
+ 
+   ROCBLAS_RETURN_IF_ERROR(rocblas_gemm_ex(

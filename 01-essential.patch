@@ -1,0 +1,283 @@
+diff --git a/include/onnxruntime/core/graph/constants.h b/include/onnxruntime/core/graph/constants.h
+index 9b26ba914c..d785eaf6d5 100644
+--- a/include/onnxruntime/core/graph/constants.h
++++ b/include/onnxruntime/core/graph/constants.h
+@@ -42,7 +42,7 @@ constexpr const char* kDmlExecutionProvider = "DmlExecutionProvider";
+ constexpr const char* kMIGraphXExecutionProvider = "MIGraphXExecutionProvider";
+ constexpr const char* kAclExecutionProvider = "ACLExecutionProvider";
+ constexpr const char* kArmNNExecutionProvider = "ArmNNExecutionProvider";
+-constexpr const char* kRocmExecutionProvider = "ROCMExecutionProvider";
++constexpr const char* kRocmExecutionProvider = "CUDAExecutionProvider";
+ constexpr const char* kCoreMLExecutionProvider = "CoreMLExecutionProvider";
+ constexpr const char* kJsExecutionProvider = "JsExecutionProvider";
+ constexpr const char* kSnpeExecutionProvider = "SNPEExecutionProvider";
+diff --git a/onnxruntime/core/providers/rocm/cu_inc/common.cuh b/onnxruntime/core/providers/rocm/cu_inc/common.cuh
+index 5f966ac746..5e5d30056a 100644
+--- a/onnxruntime/core/providers/rocm/cu_inc/common.cuh
++++ b/onnxruntime/core/providers/rocm/cu_inc/common.cuh
+@@ -369,7 +369,14 @@ struct alignas(sizeof(T) * vec_size) aligned_vector {
+ #define HIP_KERNEL_ASSERT(...) assert(__VA_ARGS__)
+ 
+ // WARP related definitions and functions
+-constexpr int GPU_WARP_SIZE = warpSize;
++// RDNA (gfx10/11/12) executes wave32 by default, where the HIP runtime reports
++// warpSize == 32. CDNA (gfx9xx) runs wave64. ORT's warp-level kernels are
++// templated on this constant and require it to match the hardware lane count,
++// otherwise reductions (e.g. Softmax) produce silently wrong results. We use 32
++// here because gfx1201 is the target; if you build for gfx9xx CDNA, change to
++// 64. The standalone tests in this codebase confirmed gfx1201 reports
++// warpSize=32 at runtime.
++constexpr int GPU_WARP_SIZE = 32;
+ inline int GPU_WARP_SIZE_HOST = warpSizeDynamic();
+ 
+ template <typename T>
+diff --git a/onnxruntime/core/providers/rocm/nn/conv.cc b/onnxruntime/core/providers/rocm/nn/conv.cc
+index 6214ec7bc0..7380d87815 100644
+--- a/onnxruntime/core/providers/rocm/nn/conv.cc
++++ b/onnxruntime/core/providers/rocm/nn/conv.cc
+@@ -1,6 +1,8 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <algorithm>
++
+ #include "core/providers/rocm/nn/conv.h"
+ #include "core/common/span_utils.h"
+ #include "core/providers/rocm/nn/conv_impl.h"
+@@ -63,6 +65,14 @@ size_t GetMaxWorkspaceSize(miopenHandle_t handle, const MiopenConvState<miopenCo
+     if (miopenStatusSuccess != err || sz == 0 || sz < max_ws_size || sz > free) continue;
+     max_ws_size = sz;
+   }
++  // miopenConvolutionForwardGetWorkSpaceSize() can return 0 on gfx1201 (RDNA4)
++  // for many shapes, which causes FindAlgorithm to evaluate only zero-workspace
++  // solvers and miss faster GEMM-based paths. Fall back to a bounded workspace
++  // (capped to avoid GPU hangs from near-VRAM scratch allocations).
++  if (max_ws_size == 0) {
++    constexpr size_t kFallbackWsCap = size_t{512} * 1024 * 1024;
++    max_ws_size = std::min(free, kFallbackWsCap);
++  }
+   return max_ws_size;
+ }
+ 
+@@ -300,7 +310,7 @@ Status Conv<T, NHWC>::UpdateState(OpKernelContext* context, bool bias_expected)
+           &perf,
+           algo_search_workspace.get(),
+           max_ws_size,
+-          false));  // Do not do exhaustive algo search.
++          rocm_ep->GetMiopenConvExhaustiveSearch()));  // Honor provider option.
+       s_.cached_benchmark_fwd_results.insert(x_dims_miopen, {perf.fwd_algo, perf.memory});
+     }
+     const auto& perf = s_.cached_benchmark_fwd_results.at(x_dims_miopen);
+diff --git a/onnxruntime/core/providers/rocm/nn/conv_transpose.cc b/onnxruntime/core/providers/rocm/nn/conv_transpose.cc
+index 7447113fdf..da8fdb032c 100644
+--- a/onnxruntime/core/providers/rocm/nn/conv_transpose.cc
++++ b/onnxruntime/core/providers/rocm/nn/conv_transpose.cc
+@@ -1,6 +1,8 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <algorithm>
++
+ #include "conv_transpose.h"
+ 
+ namespace onnxruntime {
+@@ -39,6 +41,8 @@ Status ConvTranspose<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
+ template <typename T, bool NHWC>
+ Status ConvTranspose<T, NHWC>::DoConvTranspose(OpKernelContext* context, bool dynamic_padding) const {
+   typedef typename ToHipType<T>::MappedType HipT;
++  const ROCMExecutionProvider* rocm_ep =
++      static_cast<const ROCMExecutionProvider*>(this->Info().GetExecutionProvider());
+ 
+   const Tensor* X = context->Input<Tensor>(0);
+   const TensorShape& x_shape = X->Shape();
+@@ -128,7 +132,19 @@ Status ConvTranspose<T, NHWC>::DoConvTranspose(OpKernelContext* context, bool dy
+       y_data = reinterpret_cast<HipT*>(p.Y->MutableData<T>());
+ 
+       if (!s_.cached_benchmark_bwd_results.contains(x_dims)) {
+-        IAllocatorUniquePtr<void> algo_search_workspace = GetScratchBuffer<void>(AlgoSearchWorkspaceSize, context->GetComputeStream());
++        // Give MIOpen more workspace so GEMM-based bwd-data solvers can be
++        // evaluated on gfx1201 (RDNA4), but cap to avoid GPU hangs from
++        // near-VRAM scratch allocations.
++        size_t bwd_ws_size = AlgoSearchWorkspaceSize;
++        {
++          constexpr size_t kBwdWsCap = size_t{512} * 1024 * 1024;
++          size_t free_mem, total_mem;
++          if (hipMemGetInfo(&free_mem, &total_mem) == hipSuccess) {
++            size_t available = std::min(static_cast<size_t>(free_mem * 0.5), kBwdWsCap);
++            if (available > bwd_ws_size) bwd_ws_size = available;
++          }
++        }
++        IAllocatorUniquePtr<void> algo_search_workspace = GetScratchBuffer<void>(bwd_ws_size, context->GetComputeStream());
+ 
+         miopenConvAlgoPerf_t perf;
+         int algo_count = 1;
+@@ -145,8 +161,8 @@ Status ConvTranspose<T, NHWC>::DoConvTranspose(OpKernelContext* context, bool dy
+             &algo_count,
+             &perf,
+             algo_search_workspace.get(),
+-            AlgoSearchWorkspaceSize,
+-            false));
++            bwd_ws_size,
++            rocm_ep->GetMiopenConvExhaustiveSearch()));
+         s_.cached_benchmark_bwd_results.insert(x_dims, {perf.bwd_data_algo, perf.memory});
+       }
+ 
+diff --git a/onnxruntime/core/providers/rocm/rocm_execution_provider.cc b/onnxruntime/core/providers/rocm/rocm_execution_provider.cc
+index d7c5098d9d..b623aa3430 100644
+--- a/onnxruntime/core/providers/rocm/rocm_execution_provider.cc
++++ b/onnxruntime/core/providers/rocm/rocm_execution_provider.cc
+@@ -1,6 +1,11 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <unordered_set>
++
+ #include "core/common/inlined_containers.h"
+ #include "core/providers/shared_library/provider_api.h"
+ #include "core/platform/env_var_utils.h"
+@@ -2255,9 +2260,35 @@ std::unique_ptr<onnxruntime::IDataTransfer> ROCMExecutionProvider::GetDataTransf
+   return std::make_unique<onnxruntime::GPUDataTransfer>();
+ }
+ 
++// Diagnostic helpers: parse comma-separated env vars into a set of op types.
++// ROCM_DENY_OPS="LayerNorm,GroupNorm" -> those ops will be pushed to CPU.
++// ROCM_ALLOW_OPS_ONLY="Conv,ConvTranspose" -> only those ops stay on ROCm, all
++//   other ops fall back to CPU. Takes precedence over deny.
++// ROCM_LOG_OP_PLACEMENT=1 -> stderr log of each node's placement decision.
++static std::unordered_set<std::string> ParseOpSetEnv(const char* var) {
++  std::unordered_set<std::string> s;
++  const char* v = std::getenv(var);
++  if (!v || !*v) return s;
++  std::string buf;
++  for (const char* p = v; ; ++p) {
++    if (*p == ',' || *p == '\0') {
++      if (!buf.empty()) s.insert(buf);
++      buf.clear();
++      if (*p == '\0') break;
++    } else if (*p != ' ' && *p != '\t') {
++      buf.push_back(*p);
++    }
++  }
++  return s;
++}
++
+ std::vector<std::unique_ptr<ComputeCapability>>
+ ROCMExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph,
+                                      const IKernelLookup& kernel_lookup) const {
++  static const auto deny_set  = ParseOpSetEnv("ROCM_DENY_OPS");
++  static const auto allow_set = ParseOpSetEnv("ROCM_ALLOW_OPS_ONLY");
++  static const bool log_placement = []{ const char* v = std::getenv("ROCM_LOG_OP_PLACEMENT"); return v && *v && *v != '0'; }();
++
+   InlinedVector<NodeIndex> candidates;
+   for (auto& node_index : graph.GetNodesInTopologicalOrder()) {
+     const auto* p_node = graph.GetNode(node_index);
+@@ -2288,6 +2319,21 @@ ROCMExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph,
+       // cast is not compute heavy, and may be placed outside
+     }
+ 
++    // Diagnostic env-driven op filtering.
++    if (!allow_set.empty() && allow_set.find(node.OpType()) == allow_set.end()) {
++      not_supported = true;
++      force_inside = false;
++    }
++    if (!deny_set.empty() && deny_set.find(node.OpType()) != deny_set.end()) {
++      not_supported = true;
++      force_inside = false;
++    }
++    if (log_placement) {
++      std::fprintf(stderr, "[ROCm-EP] node op=%s name=%s -> %s\n",
++                   node.OpType().c_str(), node.Name().c_str(),
++                   (not_supported && !force_inside) ? "CPU" : "ROCm");
++    }
++
+     if (!force_inside && not_supported) {
+       if (not_supported) {
+         LOGS_DEFAULT(WARNING) << "ROCM kernel not supported. Fallback to CPU execution provider for Op type: " << node.OpType() << " node name: " << node.Name();
+diff --git a/onnxruntime/core/providers/rocm/rocm_execution_provider_info.cc b/onnxruntime/core/providers/rocm/rocm_execution_provider_info.cc
+index 650635c153..eb3ce33de6 100644
+--- a/onnxruntime/core/providers/rocm/rocm_execution_provider_info.cc
++++ b/onnxruntime/core/providers/rocm/rocm_execution_provider_info.cc
+@@ -24,6 +24,12 @@ constexpr const char* kMiopenConvUseMaxWorkspace = "miopen_conv_use_max_workspac
+ constexpr const char* kTunableOpEnable = "tunable_op_enable";
+ constexpr const char* kTunableOpTuningEnable = "tunable_op_tuning_enable";
+ constexpr const char* kTunableOpMaxTuningDurationMs = "tunable_op_max_tuning_duration_ms";
++// CUDA EP compatibility aliases
++constexpr const char* kCudnnConvAlgoSearch = "cudnn_conv_algo_search";
++constexpr const char* kCudnnConvExhaustiveSearch = "cudnn_conv_exhaustive_search";
++constexpr const char* kCudnnConvUseMaxWorkspace = "cudnn_conv_use_max_workspace";
++constexpr const char* kEnableCudaGraph = "enable_cuda_graph";
++constexpr const char* kUserComputeStream = "user_compute_stream";
+ }  // namespace provider_option_names
+ }  // namespace rocm
+ 
+@@ -102,6 +108,26 @@ ROCMExecutionProviderInfo ROCMExecutionProviderInfo::FromProviderOptions(const P
+                 ORT_RETURN_IF_ERROR(ParseStringWithClassicLocale(value_str, info.tunable_op.max_tuning_duration_ms));
+                 return Status::OK();
+               })
++          // CUDA EP compatibility: map CUDA-specific option names to the
++          // closest ROCm equivalents. CUDA's cudnn_conv_algo_search accepts
++          // {EXHAUSTIVE, HEURISTIC, DEFAULT} or {0,1}. Map EXHAUSTIVE/1 to true.
++          .AddValueParser(
++              rocm::provider_option_names::kCudnnConvAlgoSearch,
++              [&info](const std::string& value_str) -> Status {
++                if (value_str == "EXHAUSTIVE" || value_str == "1") {
++                  info.miopen_conv_exhaustive_search = true;
++                }
++                return Status::OK();
++              })
++          .AddAssignmentToReference(
++              rocm::provider_option_names::kCudnnConvExhaustiveSearch,
++              info.miopen_conv_exhaustive_search)
++          .AddAssignmentToReference(
++              rocm::provider_option_names::kCudnnConvUseMaxWorkspace, info.miopen_conv_use_max_workspace)
++          .AddValueParser(rocm::provider_option_names::kEnableCudaGraph,
++              [](const std::string&) -> Status { return Status::OK(); })
++          .AddValueParser(rocm::provider_option_names::kUserComputeStream,
++              [](const std::string&) -> Status { return Status::OK(); })
+           .Parse(options));
+ 
+   ROCMExecutionProviderExternalAllocatorInfo alloc_info{alloc, free, empty_cache};
+diff --git a/onnxruntime/core/providers/rocm/rocm_execution_provider_info.h b/onnxruntime/core/providers/rocm/rocm_execution_provider_info.h
+index e35c0cc0af..b5d7c1a8be 100644
+--- a/onnxruntime/core/providers/rocm/rocm_execution_provider_info.h
++++ b/onnxruntime/core/providers/rocm/rocm_execution_provider_info.h
+@@ -38,6 +38,11 @@ struct ROCMExecutionProviderExternalAllocatorInfo {
+ 
+ namespace rocm {
+ struct TunableOpInfo {
++  // Cannot default to true: TunableOp requires RTTI for CreateSignature() but
++  // ORT is built with -fno-rtti. Attempts to enable trigger:
++  //   "TunableOp must be built with RTTI enabled" at framework/tunable.h:297
++  // Leave disabled by default; users can opt in via provider option only after
++  // rebuilding with RTTI.
+   bool enable{false};
+   bool tuning_enable{false};
+   int max_tuning_duration_ms{};
+@@ -48,7 +53,10 @@ struct ROCMExecutionProviderInfo {
+   OrtDevice::DeviceId device_id{0};
+   size_t gpu_mem_limit{std::numeric_limits<size_t>::max()};                         // Will be over-ridden by contents of `default_memory_arena_cfg` (if specified)
+   ArenaExtendStrategy arena_extend_strategy{ArenaExtendStrategy::kNextPowerOfTwo};  // Will be over-ridden by contents of `default_memory_arena_cfg` (if specified)
+-  bool miopen_conv_exhaustive_search{false};
++  // Default to true on gfx1201: MIOpen's heuristic fast path on RDNA4 routinely
++  // picks suboptimal solvers; exhaustive search at first run (~tens of ms per
++  // unique conv shape) lets MIOpen evaluate all candidates and cache the best.
++  bool miopen_conv_exhaustive_search{true};
+   bool do_copy_in_default_stream{true};
+   bool has_user_compute_stream{false};
+   void* user_compute_stream{nullptr};
+diff --git a/onnxruntime/core/providers/shared_library/provider_api.h b/onnxruntime/core/providers/shared_library/provider_api.h
+index 53ba4874c6..4522ef7d7a 100644
+--- a/onnxruntime/core/providers/shared_library/provider_api.h
++++ b/onnxruntime/core/providers/shared_library/provider_api.h
+@@ -248,7 +248,7 @@ constexpr const char* kCudaExecutionProvider = "CUDAExecutionProvider";
+ constexpr const char* kCannExecutionProvider = "CANNExecutionProvider";
+ constexpr const char* kDnnlExecutionProvider = "DnnlExecutionProvider";
+ constexpr const char* kOpenVINOExecutionProvider = "OpenVINOExecutionProvider";
+-constexpr const char* kRocmExecutionProvider = "ROCMExecutionProvider";
++constexpr const char* kRocmExecutionProvider = "CUDAExecutionProvider";
+ constexpr const char* kTensorrtExecutionProvider = "TensorrtExecutionProvider";
+ constexpr const char* kMIGraphXExecutionProvider = "MIGraphXExecutionProvider";
+ constexpr const char* kQnnExecutionProvider = "QNNExecutionProvider";
