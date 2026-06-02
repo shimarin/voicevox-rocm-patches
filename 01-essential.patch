@@ -256,18 +256,6 @@ index e35c0cc0af..b5d7c1a8be 100644
    bool enable{false};
    bool tuning_enable{false};
    int max_tuning_duration_ms{};
-@@ -48,7 +53,10 @@ struct ROCMExecutionProviderInfo {
-   OrtDevice::DeviceId device_id{0};
-   size_t gpu_mem_limit{std::numeric_limits<size_t>::max()};                         // Will be over-ridden by contents of `default_memory_arena_cfg` (if specified)
-   ArenaExtendStrategy arena_extend_strategy{ArenaExtendStrategy::kNextPowerOfTwo};  // Will be over-ridden by contents of `default_memory_arena_cfg` (if specified)
--  bool miopen_conv_exhaustive_search{false};
-+  // Default to true on gfx1201: MIOpen's heuristic fast path on RDNA4 routinely
-+  // picks suboptimal solvers; exhaustive search at first run (~tens of ms per
-+  // unique conv shape) lets MIOpen evaluate all candidates and cache the best.
-+  bool miopen_conv_exhaustive_search{true};
-   bool do_copy_in_default_stream{true};
-   bool has_user_compute_stream{false};
-   void* user_compute_stream{nullptr};
 diff --git a/onnxruntime/core/providers/shared_library/provider_api.h b/onnxruntime/core/providers/shared_library/provider_api.h
 index 53ba4874c6..4522ef7d7a 100644
 --- a/onnxruntime/core/providers/shared_library/provider_api.h

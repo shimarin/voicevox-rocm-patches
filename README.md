@@ -59,7 +59,11 @@ VOICEVOX engine 0.25.x (linux-x64-nvidia 配布版) を AMD Radeon RX 9070 XT
     (Gentoo ebuild の REQUIRED_USE をパスするため CDNA target も併用が必要)
 - CMake 3.26 以上 (検証は cmake 4.x でも動作確認済み、CMP0169 で対応)
 - Clang 22 (ROCm 7.2 同梱の AMD LLVM)
-- VOICEVOX engine 0.25.x の linux-x64-nvidia 配布版が手元にあること
+- `hipify-perl` — `dev-util/hipify-clang` (Portage) でインストールされる
+  `/usr/bin/hipify-perl` を使用。未インストールの場合は管理者に emerge を依頼するか、
+  GitHub Releases (`ROCm/HIPIFY`) からスクリプト単体をダウンロードして
+  `-Donnxruntime_HIPIFY_PERL=/path/to/hipify-perl` で cmake に渡す
+- VOICEVOX engine 0.25.x の linux-x64-nvidia 配布版、または `VOICEVOX.AppImage` が手元にあること
 
 ---
 
@@ -85,7 +89,7 @@ git submodule update --init --recursive
 ROCm 7.2 / Gentoo / gfx1201 を想定:
 
 ```bash
-mkdir -p build/Release2 && cd build/Release2
+mkdir -p build/Release && cd build/Release
 
 cmake ../../cmake \
   -DCMAKE_BUILD_TYPE=Release \
@@ -93,18 +97,27 @@ cmake ../../cmake \
   -Donnxruntime_ROCM_HOME=/usr \
   -Donnxruntime_ROCM_VERSION=7.2 \
   -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
-  -DCMAKE_C_COMPILER=/usr/bin/clang \
-  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
-  -DCMAKE_HIP_COMPILER=/usr/bin/clang++ \
+  -DCMAKE_C_COMPILER=/usr/bin/cc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+  -DCMAKE_HIP_COMPILER=/usr/lib/llvm/22/bin/clang++ \
   -Donnxruntime_BUILD_SHARED_LIB=ON \
   -Donnxruntime_BUILD_UNIT_TESTS=OFF \
   -Donnxruntime_DISABLE_RTTI=ON \
   -Donnxruntime_DISABLE_EXCEPTIONS=OFF \
-  -Donnxruntime_ENABLE_PYTHON=OFF
+  -Donnxruntime_ENABLE_PYTHON=OFF \
+  -Donnxruntime_USE_COMPOSABLE_KERNEL=OFF \
+  -Donnxruntime_DISABLE_CONTRIB_OPS=ON \
+  -Donnxruntime_HIPIFY_PERL=/usr/bin/hipify-perl \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ```
 
-ROCm のインストール先が `/usr` 以外なら `-Donnxruntime_ROCM_HOME=` を調整。
-別アーキ向けには `-DCMAKE_HIP_ARCHITECTURES=` を変更。
+- ROCm のインストール先が `/usr` 以外なら `-Donnxruntime_ROCM_HOME=` を調整
+- 別アーキ向けには `-DCMAKE_HIP_ARCHITECTURES=` を変更
+- `hipify-perl` を別の場所に置いた場合は `-Donnxruntime_HIPIFY_PERL=` を調整
+- `-Donnxruntime_USE_COMPOSABLE_KERNEL=OFF`: composable_kernel は VOICEVOX の
+  推論に不要かつ cmake 4.x との互換性問題があるため無効化
+- `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`: cmake 4.x で依存ライブラリ
+  (google_nsync 等) の古い cmake_minimum_required を許容するために必要
 
 ### 3. ビルド (provider プラグインのみ)
 
@@ -115,13 +128,87 @@ main lib (`libonnxruntime.so`) は VOICEVOX 同梱のものを使うので、ビ
 cmake --build . --target onnxruntime_providers_rocm -j$(nproc)
 ```
 
-成果物: `build/Release2/libonnxruntime_providers_rocm.so` (約 50 MB)
+成果物: `build/Release/libonnxruntime_providers_rocm.so` (約 50 MB)
 
 ビルド時間: 並列度 16 で初回約 15 分、`.so` 単体の差分ビルドなら 1〜2 分。
 
 ---
 
-## デプロイ手順
+## AppImage リパッケージ手順 (VOICEVOX.AppImage を ROCm 対応版に差し替える)
+
+`~/.voicevox/VOICEVOX.AppImage` はコア・エンジン・エディタを 1 ファイルに統合した配布形式です。
+内部の `vv-engine/libvoicevox_onnxruntime_providers_cuda.so` を ROCm ビルドに差し替えて
+再パッケージすることで、AppImage のまま ROCm を利用できます。
+
+### 必要ツール
+
+- `squashfs-tools` (`unsquashfs` / `mksquashfs`)
+
+### スクリプトで一発実行
+
+```bash
+./repackage-appimage.sh \
+  --rocm-so /path/to/ort-fake-cuda/build/Release/libonnxruntime_providers_rocm.so \
+  --appimage ~/.voicevox/VOICEVOX.AppImage \
+  --output   ~/VOICEVOX-ROCm.AppImage
+```
+
+所要時間: squashfs 展開 + 再圧縮合わせて約 3〜5 分 (24 コア時)。
+完了後は `~/VOICEVOX-ROCm.AppImage` を通常の AppImage と同様に実行するだけです。
+
+```bash
+HIP_VISIBLE_DEVICES=0 ~/VOICEVOX-ROCm.AppImage
+```
+
+> **ROCm ライブラリ解決について**: AppRunOriginal は `LD_LIBRARY_PATH` に `${APPDIR}/usr/lib` を
+> 先頭追加するだけで、system ライブラリパスは保持されます。ROCm ライブラリ
+> (`libamdhip64.so.7`, `libMIOpen.so.1` 等) が `/usr/lib64/` にインストール済みであれば
+> 追加設定なしに解決されます。
+
+### スクリプトの内部処理
+
+| ステップ | 処理 |
+|---|---|
+| 1 | `--appimage-offset` でランタイムサイズ (944632 bytes) を取得 |
+| 2 | `unsquashfs -o <offset>` で squashfs を展開 |
+| 3 | `vv-engine/libvoicevox_onnxruntime_providers_cuda.so` を ROCm ビルド版で上書き |
+| 3b | `vv-engine/engine_internal/libstdc++.so.6` をシステム版で置換 (後述) |
+| 3c | `AppRun` に `export MIOPEN_FIND_MODE=FAST` を追記 (後述) |
+| 4 | `mksquashfs -comp zstd -b 131072 -nopad` で再圧縮 |
+| 5 | `dd` でランタイムバイナリを切り出し、新 squashfs と結合 |
+
+#### libstdc++ ABI 問題について
+
+AppImage に同梱された `libstdc++.so.6` は Ubuntu 22.04 LTS ベースのビルド環境由来で、
+`CXXABI_1.3.13` までしか提供しない。一方 Gentoo (GCC 13+) でビルドした ROCm プロバイダーは
+`CXXABI_1.3.15` を要求するため、そのまま差し替えると dlopen 時に以下のエラーが出る:
+
+```
+libstdc++.so.6: version `CXXABI_1.3.15' not found
+```
+
+スクリプトは `ldconfig -p` でシステムの `libstdc++.so.6` を自動検出し、同梱版と差し替える。
+libstdc++ は後方互換なので、エンジン内の他のコンポーネントへの影響はない。
+
+#### MIOPEN_FIND_MODE=FAST について
+
+MIOpen はデフォルト (`NORMAL` モード) で、未キャッシュのコンボリューション設定に対して
+全ソルバーを実際に実行・計時して最適なものを選ぶ (Find フェーズ)。
+gfx1201 ではテキスト長が変わるたびに入力テンソルサイズが変わるため、
+**新しい文言を合成するたびに数秒〜十数秒のスパイク**が生じる。
+
+`MIOPEN_FIND_MODE=FAST` にするとヒューリスティクスで即座にソルバーを選ぶため、
+このスパイクが消える。VOICEVOX の合成品質・速度への影響は実測で確認されていない
+(平均 RT 比は 16× 前後で変わらず)。
+
+スクリプトは `AppRun` の `apprun=...` 行の直後に `export MIOPEN_FIND_MODE=FAST` を挿入する。
+
+ファイル名を `_cuda.so` のまま維持するのは VOICEVOX core が dlopen する名前に合わせるため
+(上記「デプロイ手順」と同じ理由)。
+
+---
+
+## デプロイ手順 (engine 単体配布版への差し替え)
 
 ### 1. NVIDIA オリジナルを退避
 
@@ -135,7 +222,7 @@ cp libvoicevox_onnxruntime_providers_cuda.so \
 ### 2. ビルド成果物を差し替え
 
 ```bash
-cp /path/to/ort-fake-cuda/build/Release2/libonnxruntime_providers_rocm.so \
+cp /path/to/ort-fake-cuda/build/Release/libonnxruntime_providers_rocm.so \
    libvoicevox_onnxruntime_providers_cuda.so
 ```
 
